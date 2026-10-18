@@ -5,6 +5,6 @@ compatibility_date = "2026-10-01"
 [triggers]
 crons = ["*/3 * * * *"]
 
-# No id on purpose: wrangler creates the namespace on the first deploy.
 [[kv_namespaces]]
 binding = "STATE"
+id = "4e64d63299e843c3b7afb357624aad6f"
