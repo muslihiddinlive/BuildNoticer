@@ -5,11 +5,10 @@ Butun profildagi (private ham) repo'larni kuzatadi, muvaffaqiyatli build'da arti
 
 ## Ulash
 
-1. Cloudflare'da Worker yarating va `worker.js` ni joylang.
-2. `STATE` nomli KV namespace yarating va Worker'ga shu nom bilan ulang.
-3. Secret'lar: `GITHUB_TOKEN` (fine-grained, All repositories, Actions: Read + Metadata: Read), `BOT_TOKEN`, `CHAT_ID`.
-4. Cron trigger: `*/3 * * * *`.
-5. Botga avval `/start` yozing.
+1. Cloudflare → Workers & Pages → Create → Import a repository: shu repo'ni tanlang, Worker nomi `buildnoticer`.
+2. Deploy `wrangler.toml` bo'yicha o'zi ishlaydi: `STATE` KV xotirasi avtomatik yaratiladi va cron (`*/3 * * * *`) o'rnatiladi.
+3. Worker → Settings → Variables and Secrets: `GITHUB_TOKEN` (fine-grained, All repositories, Actions: Read + Metadata: Read), `BOT_TOKEN`, `CHAT_ID`.
+4. Botga avval `/start` yozing.
 
 Ixtiyoriy: `SUBREQUEST_LIMIT` (Workers Paid rejasida `900`), `TRIGGER_KEY` (qo'lda tekshirish: `/?key=...`).
 
