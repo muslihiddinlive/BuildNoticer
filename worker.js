@@ -7,7 +7,10 @@ const GH = "https://api.github.com";
 const TG_LIMIT = 49_000_000; // Bot API uploads are capped at 50 MB
 const MAX_FILES = 3;
 const HOT_DAYS = 3; // repos pushed this recently are checked on every run
-const RESERVE = 18; // subrequests kept for repo pages and notifications
+const RESERVE = 18; // subrequests a cron run keeps for notifications
+const STATUS_RESERVE = 2; // /status only needs the final reply
+const MAX_SCAN = 70; // repos per cron run, so GitHub's 5000 requests/hour is never reached
+const QUIET_AFTER = 10 * 60e3; // a repo without builds is skipped once its last push is this old
 const RUNS_PER_REPO = 5;
 const MAX_LISTED = 15;
 const REPORT = new Set(["success", "failure", "timed_out", "cancelled", "startup_failure"]);
@@ -77,7 +80,11 @@ function spend(env) {
 async function gh(env, path) {
   spend(env);
   const r = await fetch(GH + path, { headers: ghHeaders(env) });
-  if (!r.ok) throw new Error(`GitHub ${r.status} for ${path.split("?")[0]}`);
+  if (!r.ok) {
+    const err = new Error(`GitHub ${r.status} for ${path.split("?")[0]}`);
+    err.status = r.status;
+    throw err;
+  }
   return r.json();
 }
 
@@ -112,17 +119,21 @@ const runKey = (run) => `${run.id}.${run.run_attempt || 1}`;
 // notify=true: cron run, reports finished runs and saves state.
 // notify=false: read-only look at what is running (used by /start and /status).
 async function scan(env, notify) {
-  const limit = env.budget.limit;
   const now = Date.now();
   const stored = JSON.parse((await env.STATE.get("state")) || "null");
   const state = stored || { since: new Date(now).toISOString(), seen: [], active: {} };
   state.active ||= {};
+  state.idle ||= {};
   const since = Date.parse(state.since); // the first run reports nothing older than itself
   const seen = new Set(state.seen);
 
   const all = await listRepos(env);
   const byName = new Map(all.map((r) => [r.full_name, r]));
-  const slots = Math.min(200, Math.max(10, limit - RESERVE));
+  // Repos that never had a build are skipped (until pushed again), so the 50-call budget
+  // of the free plan goes to repos that really run builds.
+  const quiet = (r) => state.idle[r.full_name] === r.pushed_at && now - Date.parse(r.pushed_at) > QUIET_AFTER;
+  const spare = env.budget.left - (notify ? RESERVE : STATUS_RESERVE);
+  const slots = Math.max(5, Math.min(notify ? MAX_SCAN : 200, spare));
 
   // Repos with a known running build are always rechecked, so its end is caught fast.
   const pinned = [...new Set(Object.values(state.active).map((a) => a.repo))]
@@ -131,14 +142,25 @@ async function scan(env, notify) {
     .slice(0, slots);
   const rest = all.filter((r) => !pinned.includes(r));
   const room = slots - pinned.length;
+  const busy = rest.filter((r) => !quiet(r));
+  const idle = rest.filter(quiet);
   const hotCutoff = now - HOT_DAYS * 86400e3;
-  const hot = rest.filter((r) => Date.parse(r.pushed_at) > hotCutoff).slice(0, Math.ceil(room / 2));
-  const cold = rest.filter((r) => !hot.includes(r));
-  const coldCount = Math.min(cold.length, room - hot.length);
-  // Cold repos rotate with the clock, so no cursor has to be stored (KV writes are limited).
-  const start = cold.length ? (Math.floor(now / 60e3) * coldCount) % cold.length : 0;
-  const picked = Array.from({ length: coldCount }, (_, i) => cold[(start + i) % cold.length]);
-  const repos = [...pinned, ...hot, ...picked];
+  const hot = busy.filter((r) => Date.parse(r.pushed_at) > hotCutoff).slice(0, Math.ceil(room / 2));
+  const coldBusy = busy.filter((r) => !hot.includes(r));
+  // What does not fit rotates with the clock, so no cursor has to be stored (KV writes are limited).
+  const take = (list, n) => {
+    if (n <= 0) return [];
+    if (list.length <= n) return list;
+    const start = (Math.floor(now / 60e3) * n) % list.length;
+    return Array.from({ length: n }, (_, i) => list[(start + i) % list.length]);
+  };
+  const busyPick = take(coldBusy, room - hot.length);
+  const idlePick = take(idle, room - hot.length - busyPick.length);
+  const missed = coldBusy.length - busyPick.length; // repos that did not fit this time
+  const repos = [...pinned, ...hot, ...busyPick, ...idlePick];
+
+  const idleNow = {};
+  for (const [name, pushed] of Object.entries(state.idle)) if (byName.has(name)) idleNow[name] = pushed;
 
   const fresh = [];
   const running = {};
@@ -148,6 +170,8 @@ async function scan(env, notify) {
       try {
         const d = await gh(env, `/repos/${repo.full_name}/actions/runs?per_page=${RUNS_PER_REPO}`);
         checked.add(repo.full_name);
+        if (d.total_count === 0) idleNow[repo.full_name] = repo.pushed_at;
+        else delete idleNow[repo.full_name];
         for (const run of d.workflow_runs) {
           if (LIVE.has(run.status)) {
             running[run.id] = {
@@ -171,6 +195,7 @@ async function scan(env, notify) {
           }
         }
       } catch (e) {
+        if (e.status === 404) idleNow[repo.full_name] = repo.pushed_at; // no Actions access
         console.log(e.message);
       }
     }),
@@ -188,7 +213,7 @@ async function scan(env, notify) {
   }
 
   if (!notify) {
-    return { active: Object.values(active), checked: repos.length, total: all.length };
+    return { active: Object.values(active), checked: repos.length, total: all.length, missed };
   }
 
   fresh.sort((a, b) => Date.parse(a.run.updated_at) - Date.parse(b.run.updated_at));
@@ -231,16 +256,19 @@ async function scan(env, notify) {
       .map(([id, a]) => id + (a.announced ? "!" : ""))
       .sort()
       .join();
-  const changed = sig(state.active) !== sig(active);
+  const idleSig = (o) => Object.entries(o).map(([k, v]) => `${k}@${v}`).sort().join();
+  const changed = sig(state.active) !== sig(active) || idleSig(state.idle) !== idleSig(idleNow);
   if (!stored || sent.length || changed) {
     state.seen = [...seen].slice(-300);
     state.active = active;
+    state.idle = idleNow;
     delete state.cursor;
     await env.STATE.put("state", JSON.stringify(state));
   }
   return {
     total: all.length,
     checked: repos.length,
+    missed,
     running: Object.keys(active).length,
     found: fresh.length,
     sent,
@@ -264,10 +292,10 @@ async function onUpdate(env, update) {
       chat_id: env.CHAT_ID,
       text: cmd === "/start" ? "👋 Salom! Build'larni tekshiryapman..." : "🔍 Tekshiryapman...",
     });
-    const { active, checked, total } = await scan(env, false);
+    const { active, total, missed } = await scan(env, false);
     await tg(env, "sendMessage", {
       chat_id: env.CHAT_ID,
-      text: statusText(active, checked, total),
+      text: statusText(active, total, missed),
       disable_web_page_preview: true,
     });
   } catch (e) {
@@ -281,8 +309,11 @@ function ago(iso) {
   return m < 60 ? `${m} daq` : `${Math.floor(m / 60)} soat ${m % 60} daq`;
 }
 
-function statusText(active, checked, total) {
-  const scope = `(${total} ta repo'dan ${checked} tasi tekshirildi)`;
+function statusText(active, total, missed) {
+  const scope =
+    missed === 0
+      ? `✅ Hammasi ko'rib chiqildi (${total} ta repo)`
+      : `⚠️ ${total} ta repo'dan ${total - missed} tasi ko'rib chiqildi, qolgan ${missed} tasi har daqiqada navbat bilan tekshiriladi`;
   if (!active.length) return `😴 Hozir faol build yo'q.\n${scope}`;
   const list = [...active].sort((a, b) => Date.parse(a.started) - Date.parse(b.started));
   const lines = list
