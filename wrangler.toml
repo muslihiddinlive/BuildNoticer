@@ -1,0 +1,11 @@
+name = "gh-build-notifier"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+[triggers]
+crons = ["*/3 * * * *"]
+
+# npx wrangler kv namespace create STATE  -> paste the printed id below
+[[kv_namespaces]]
+binding = "STATE"
+id = "PASTE_KV_ID_HERE"
