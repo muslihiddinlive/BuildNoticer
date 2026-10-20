@@ -10,8 +10,21 @@ Butun profildagi (private ham) repo'larni kuzatadi.
 - ❌ yiqilganda (`failure`, `timed_out`, `startup_failure`)
 - 🚫 bekor qilinganda
 
-Botga `/start` yoki `/status` yozsangiz, hozir faol build'lar ro'yxatini yuboradi.
+Botga `/start` yoki `/status` yozsangiz, hozir faol build va deploy'lar ro'yxatini yuboradi.
 Worker har 1 daqiqada tekshiradi, shuning uchun xabar ~1 daqiqagacha kechikishi mumkin.
+
+## Render deploy'lar (ixtiyoriy)
+
+`RENDER_API_KEY` qo'yilsa, Render servislaridagi deploy'lar ham kuzatiladi:
+
+- 🚀 deploy boshlanganda
+- ✅ `live` bo'lganda
+- ❌ `build_failed`, `update_failed`, `pre_deploy_failed`
+- 🚫 `canceled`
+
+Kalit: Render → Account Settings → API Keys. Worker'da **Secret** turida `RENDER_API_KEY` qo'shing.
+Faqat ayrim servislarni kuzatish uchun `RENDER_SERVICES` o'zgaruvchisi (servis nomi yoki `srv-...` id, vergul bilan).
+Kalit qo'yilmasa, Render qismi o'chiq turadi va avvalgidek faqat GitHub kuzatiladi.
 
 ## Ulash
 
@@ -33,6 +46,7 @@ Ixtiyoriy o'zgaruvchilar:
 ## Cheklovlar
 
 - Telegram bot 50 MB dan katta faylni yubora olmaydi, o'rniga havola yuboriladi.
+- Render ham bepul rejadagi 50 so'rov limitidan ulush oladi (bir tekshiruvda ko'pi bilan 8 ta servis), shuning uchun GitHub'dan ko'riladigan repolar ~30 dan ~20 tagacha kamayadi. Workers Paid rejasida (`SUBREQUEST_LIMIT=900`) bunday muammo yo'q.
 - Bepul rejada bir tekshiruvda ~30 ta repo ko'riladi: yaqinda push qilinganlari har safar, qolganlari navbat bilan.
 - Bot faqat `CHAT_ID` dagi chatga javob beradi.
 

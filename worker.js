@@ -1,6 +1,8 @@
 // Polls GitHub Actions across the owner's repos and reports finished runs to Telegram.
 // Also announces builds that start. /start and /status list the builds running right now.
-// Secrets: GITHUB_TOKEN, BOT_TOKEN, CHAT_ID, TRIGGER_KEY. KV binding: STATE.
+// It also watches Render deploys when RENDER_API_KEY is set (started / live / failed / canceled).
+// Secrets: GITHUB_TOKEN, BOT_TOKEN, CHAT_ID, TRIGGER_KEY, RENDER_API_KEY (optional). KV binding: STATE.
+// Optional variable RENDER_SERVICES: comma separated Render service names or ids (default: all).
 // Optional variable START_AFTER_MIN: announce a start only once the build has run that long.
 
 const GH = "https://api.github.com";
@@ -15,6 +17,18 @@ const RUNS_PER_REPO = 5;
 const MAX_LISTED = 15;
 const REPORT = new Set(["success", "failure", "timed_out", "cancelled", "startup_failure"]);
 const LIVE = new Set(["in_progress", "queued", "waiting", "requested", "pending"]);
+
+const RD = "https://api.render.com/v1";
+const RENDER_MAX = 8; // Render services checked per run (each one costs a subrequest)
+const SERVICES_TTL = 30 * 60e3; // the service list is cached in KV this long
+const R_LIVE = new Set(["created", "build_in_progress", "update_in_progress", "pre_deploy_in_progress"]);
+const R_DONE = {
+  live: ["✅", "deploy bo'ldi (live)"],
+  build_failed: ["❌", "build yiqildi"],
+  update_failed: ["❌", "deploy yiqildi (ishga tushmadi)"],
+  pre_deploy_failed: ["❌", "pre-deploy yiqildi"],
+  canceled: ["🚫", "bekor qilindi"],
+};
 
 export default {
   async scheduled(event, env, ctx) {
@@ -275,8 +289,159 @@ async function scan(env, notify) {
   };
 }
 
-function tick(env) {
-  return scan(withBudget(env), true);
+async function rd(env, path) {
+  spend(env);
+  const r = await fetch(RD + path, {
+    headers: { Authorization: `Bearer ${env.RENDER_API_KEY}`, Accept: "application/json" },
+  });
+  if (!r.ok) {
+    const err = new Error(`Render ${r.status} for ${path.split("?")[0]}`);
+    err.status = r.status;
+    throw err;
+  }
+  return r.json();
+}
+
+async function renderServices(env, rs, now) {
+  if (rs.services && now - (rs.servicesAt || 0) < SERVICES_TTL) return rs.services;
+  const only = (env.RENDER_SERVICES || "").split(",").map((x) => x.trim()).filter(Boolean);
+  const list = await rd(env, "/services?limit=100");
+  let services = list
+    .map((x) => x.service)
+    .filter((x) => x && x.suspended !== "suspended")
+    .map((x) => ({ id: x.id, name: x.name, url: x.dashboardUrl || "" }));
+  if (only.length) services = services.filter((x) => only.includes(x.id) || only.includes(x.name));
+  rs.services = services;
+  rs.servicesAt = now;
+  rs.dirty = true;
+  return services;
+}
+
+// Same idea as scan(): notify=true reports finished deploys (cron), notify=false only looks (/status).
+// Render state lives under its own KV key, so it never overwrites the GitHub state.
+async function renderScan(env, notify) {
+  if (!env.RENDER_API_KEY) return { active: [], total: 0, skipped: true };
+  const now = Date.now();
+  const stored = JSON.parse((await env.STATE.get("render")) || "null");
+  const rs = stored || { since: new Date(now).toISOString(), seen: [], active: {}, services: null, servicesAt: 0 };
+  rs.active ||= {};
+  const since = Date.parse(rs.since); // the first run reports nothing older than itself
+  const seen = new Set(rs.seen);
+
+  let services;
+  try {
+    services = await renderServices(env, rs, now);
+  } catch (e) {
+    console.log(e.message);
+    services = rs.services || [];
+  }
+
+  const cap = Math.max(1, Math.min(RENDER_MAX, env.budget.left - (notify ? RESERVE : STATUS_RESERVE) - 4));
+  const pinIds = new Set(Object.values(rs.active).map((a) => a.serviceId));
+  const pinned = services.filter((x) => pinIds.has(x.id)).slice(0, cap);
+  const rest = services.filter((x) => !pinIds.has(x.id));
+  const room = cap - pinned.length;
+  const start = rest.length ? (Math.floor(now / 60e3) * Math.max(room, 1)) % rest.length : 0;
+  const picked = rest.length <= room ? rest : Array.from({ length: room }, (_, i) => rest[(start + i) % rest.length]);
+  const targets = [...pinned, ...picked];
+
+  const fresh = [];
+  const running = {};
+  const checked = new Set();
+  await Promise.all(
+    targets.map(async (svc) => {
+      try {
+        const list = await rd(env, `/services/${svc.id}/deploys?limit=3`);
+        checked.add(svc.id);
+        for (const { deploy: d } of list) {
+          if (!d) continue;
+          const link = (svc.url ? `${svc.url}/deploys/${d.id}` : "https://dashboard.render.com");
+          const info = {
+            serviceId: svc.id,
+            name: svc.name,
+            status: d.status,
+            sha: (d.commit?.id || "").slice(0, 7),
+            title: (d.commit?.message || "").split("\n")[0].slice(0, 100),
+            url: link,
+            started: d.createdAt,
+          };
+          if (R_LIVE.has(d.status)) {
+            running[d.id] = info;
+          } else if (R_DONE[d.status] && !seen.has(d.id) && Date.parse(d.finishedAt || d.updatedAt) > since) {
+            fresh.push({ id: d.id, finished: d.finishedAt || d.updatedAt, ...info });
+          }
+        }
+      } catch (e) {
+        console.log(e.message);
+      }
+    }),
+  );
+
+  const active = {};
+  const names = new Set(services.map((x) => x.id));
+  for (const [id, a] of Object.entries(rs.active)) {
+    if (!checked.has(a.serviceId) && names.has(a.serviceId) && Date.parse(a.started) > now - 2 * 86400e3) active[id] = a;
+  }
+  for (const [id, a] of Object.entries(running)) active[id] = { ...a, announced: Boolean(rs.active[id]?.announced) };
+
+  if (!notify) return { active: Object.values(active), total: services.length };
+
+  fresh.sort((a, b) => Date.parse(a.finished) - Date.parse(b.finished));
+  const sent = [];
+  for (const d of fresh) {
+    if (env.budget.left < 6) break;
+    const [icon, label] = R_DONE[d.status];
+    try {
+      await tg(env, "sendMessage", {
+        chat_id: env.CHAT_ID,
+        text: `${icon} Render · ${d.name}\n${label}` + (d.sha ? `\n${d.sha}` : "") + (d.title ? ` · ${d.title}` : "") + `\n${d.url}`,
+        disable_web_page_preview: true,
+      });
+      seen.add(d.id);
+      sent.push(`${d.name}:${d.id}`);
+    } catch (e) {
+      console.log(e.message);
+    }
+  }
+
+  const minAge = (Number(env.START_AFTER_MIN) || 0) * 60e3;
+  for (const a of Object.values(active)) {
+    if (a.announced || !(Date.parse(a.started) > since) || now - Date.parse(a.started) < minAge) continue;
+    if (env.budget.left < 6) break;
+    try {
+      await tg(env, "sendMessage", {
+        chat_id: env.CHAT_ID,
+        text: `🚀 Render · ${a.name}\ndeploy boshlandi (${a.status})` + (a.sha ? `\n${a.sha}` : "") + (a.title ? ` · ${a.title}` : "") + `\n${a.url}`,
+        disable_web_page_preview: true,
+      });
+      a.announced = true;
+    } catch (e) {
+      console.log(e.message);
+    }
+  }
+
+  const sig = (o) => Object.entries(o).map(([id, a]) => id + (a.announced ? "!" : "")).sort().join();
+  if (!stored || sent.length || rs.dirty || sig(rs.active) !== sig(active)) {
+    delete rs.dirty;
+    rs.seen = [...seen].slice(-300);
+    rs.active = active;
+    await env.STATE.put("render", JSON.stringify(rs));
+  }
+  return { total: services.length, checked: targets.length, running: Object.keys(active).length, sent };
+}
+
+async function tick(env) {
+  env = withBudget(env);
+  // Render goes first and is capped, so a Render problem never stops the GitHub scan.
+  let render;
+  try {
+    render = await renderScan(env, true);
+  } catch (e) {
+    console.log(e.message);
+    render = { error: e.message };
+  }
+  const github = await scan(env, true);
+  return { ...github, render };
 }
 
 async function onUpdate(env, update) {
@@ -292,10 +457,14 @@ async function onUpdate(env, update) {
       chat_id: env.CHAT_ID,
       text: cmd === "/start" ? "👋 Salom! Build'larni tekshiryapman..." : "🔍 Tekshiryapman...",
     });
+    const render = await renderScan(env, false).catch((e) => {
+      console.log(e.message);
+      return { active: [] };
+    });
     const { active, total, missed } = await scan(env, false);
     await tg(env, "sendMessage", {
       chat_id: env.CHAT_ID,
-      text: statusText(active, total, missed),
+      text: statusText(active, total, missed, render.active),
       disable_web_page_preview: true,
     });
   } catch (e) {
@@ -309,12 +478,12 @@ function ago(iso) {
   return m < 60 ? `${m} daq` : `${Math.floor(m / 60)} soat ${m % 60} daq`;
 }
 
-function statusText(active, total, missed) {
+function statusText(active, total, missed, renderActive = []) {
   const scope =
     missed === 0
       ? `✅ Hammasi ko'rib chiqildi (${total} ta repo)`
       : `⚠️ ${total} ta repo'dan ${total - missed} tasi ko'rib chiqildi, qolgan ${missed} tasi har daqiqada navbat bilan tekshiriladi`;
-  if (!active.length) return `😴 Hozir faol build yo'q.\n${scope}`;
+  if (!active.length && !renderActive.length) return `😴 Hozir faol build va deploy yo'q.\n${scope}`;
   const list = [...active].sort((a, b) => Date.parse(a.started) - Date.parse(b.started));
   const lines = list
     .slice(0, MAX_LISTED)
@@ -324,7 +493,15 @@ function statusText(active, total, missed) {
         `${a.name} #${a.n} · ${a.branch} · ${ago(a.started)}\n${a.url}`,
     );
   const more = list.length > MAX_LISTED ? `\n\n+${list.length - MAX_LISTED} ta yana` : "";
-  return `Faol build'lar (${list.length}):\n\n${lines.join("\n\n")}${more}\n\nTugashi bilan xabar beraman.\n${scope}`;
+  const parts = [];
+  if (list.length) parts.push(`Faol build'lar (${list.length}):\n\n${lines.join("\n\n")}${more}`);
+  if (renderActive.length) {
+    const rl = renderActive.map(
+      (a) => `${a.status === "created" ? "⏳" : "🔄"} Render · ${a.name}\n${a.status} · ${ago(a.started)}\n${a.url}`,
+    );
+    parts.push(`Render deploy'lar (${rl.length}):\n\n${rl.join("\n\n")}`);
+  }
+  return `${parts.join("\n\n")}\n\nTugashi bilan xabar beraman.\n${scope}`;
 }
 
 async function notify_(env, { repo, run }) {
