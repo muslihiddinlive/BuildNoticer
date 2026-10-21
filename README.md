@@ -13,6 +13,16 @@ Butun profildagi (private ham) repo'larni kuzatadi.
 Botga `/start` yoki `/status` yozsangiz, hozir faol build va deploy'lar ro'yxatini yuboradi.
 Worker har 1 daqiqada tekshiradi, shuning uchun xabar ~1 daqiqagacha kechikishi mumkin.
 
+## Buyruqlar
+
+Telegramda `/` bosganda menyu chiqadi (cron birinchi ishlaganda o'zi ro'yxatdan o'tkazadi):
+
+- `/status`: faol build va deploy'lar
+- `/builds`: faqat GitHub build'lar
+- `/deploys`: Render servislarining oxirgi deploy'i
+- `/logs servis`: servisning oxirgi deploy build logi (`/logs servis app` — ish logi, oxirgi soat)
+- `/help`: buyruqlar ro'yxati
+
 ## Render deploy'lar (ixtiyoriy)
 
 `RENDER_API_KEY` qo'yilsa, Render servislaridagi deploy'lar ham kuzatiladi:

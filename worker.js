@@ -14,9 +14,31 @@ const STATUS_RESERVE = 2; // /status only needs the final reply
 const MAX_SCAN = 70; // repos per cron run, so GitHub's 5000 requests/hour is never reached
 const QUIET_AFTER = 10 * 60e3; // a repo without builds is skipped once its last push is this old
 const RUNS_PER_REPO = 5;
+const REQ_TIMEOUT = 10_000; // ms: a hanging API call must never freeze the whole run
+const STATUS_DEADLINE = 25_000; // ms: /status always answers before Cloudflare cuts the worker (30 s)
 const MAX_LISTED = 15;
 const REPORT = new Set(["success", "failure", "timed_out", "cancelled", "startup_failure"]);
 const LIVE = new Set(["in_progress", "queued", "waiting", "requested", "pending"]);
+
+// The "/" menu in Telegram. Registered once automatically (see ensureCommands); bump the version to re-register.
+const CMDS_VERSION = "2";
+const COMMANDS = [
+  { command: "status", description: "Faol build va deploy'lar" },
+  { command: "builds", description: "Faqat GitHub build'lar" },
+  { command: "deploys", description: "Render: oxirgi deploy'lar" },
+  { command: "logs", description: "Render deploy logi: /logs servis [app]" },
+  { command: "help", description: "Buyruqlar ro'yxati" },
+  { command: "start", description: "Botni ishga tushirish" },
+];
+const HELP = [
+  "Buyruqlar:",
+  ...COMMANDS.filter((c) => c.command !== "start").map((c) => `/${c.command} — ${c.description}`),
+  "",
+  "/logs mybot — mybot'ning oxirgi deploy build logi",
+  "/logs mybot app — shu servisning ish (runtime) logi",
+  "",
+  "Build yoki deploy tugasa, o'zim xabar yuboraman.",
+].join("\n");
 
 const RD = "https://api.render.com/v1";
 const RENDER_MAX = 8; // Render services checked per run (each one costs a subrequest)
@@ -62,6 +84,7 @@ export default {
           allowed_updates: ["message"],
         }),
       });
+      await env.STATE.delete("cmds"); // the next cron run registers the "/" menu again
       return new Response(await r.text(), { headers: { "content-type": "application/json" } });
     }
 
@@ -93,7 +116,7 @@ function spend(env) {
 
 async function gh(env, path) {
   spend(env);
-  const r = await fetch(GH + path, { headers: ghHeaders(env) });
+  const r = await fetch(GH + path, { headers: ghHeaders(env), signal: AbortSignal.timeout(REQ_TIMEOUT) });
   if (!r.ok) {
     const err = new Error(`GitHub ${r.status} for ${path.split("?")[0]}`);
     err.status = r.status;
@@ -109,6 +132,7 @@ async function tg(env, method, body) {
     method: "POST",
     headers: isForm ? {} : { "content-type": "application/json" },
     body: isForm ? body : JSON.stringify(body),
+    signal: AbortSignal.timeout(isForm ? 60_000 : REQ_TIMEOUT),
   });
   const data = await r.json().catch(() => ({}));
   if (!data.ok) throw new Error(`Telegram ${method}: ${data.description || r.status}`);
@@ -293,6 +317,7 @@ async function rd(env, path) {
   spend(env);
   const r = await fetch(RD + path, {
     headers: { Authorization: `Bearer ${env.RENDER_API_KEY}`, Accept: "application/json" },
+    signal: AbortSignal.timeout(REQ_TIMEOUT),
   });
   if (!r.ok) {
     const err = new Error(`Render ${r.status} for ${path.split("?")[0]}`);
@@ -309,7 +334,7 @@ async function renderServices(env, rs, now) {
   let services = list
     .map((x) => x.service)
     .filter((x) => x && x.suspended !== "suspended")
-    .map((x) => ({ id: x.id, name: x.name, url: x.dashboardUrl || "" }));
+    .map((x) => ({ id: x.id, name: x.name, url: x.dashboardUrl || "", owner: x.ownerId || "" }));
   if (only.length) services = services.filter((x) => only.includes(x.id) || only.includes(x.name));
   rs.services = services;
   rs.servicesAt = now;
@@ -325,6 +350,8 @@ async function renderScan(env, notify) {
   const stored = JSON.parse((await env.STATE.get("render")) || "null");
   const rs = stored || { since: new Date(now).toISOString(), seen: [], active: {}, services: null, servicesAt: 0 };
   rs.active ||= {};
+  // /status only reads what the cron run already saved: no Render API calls, so it is instant.
+  if (!notify) return { active: Object.values(rs.active), total: rs.services?.length || 0 };
   const since = Date.parse(rs.since); // the first run reports nothing older than itself
   const seen = new Set(rs.seen);
 
@@ -430,8 +457,89 @@ async function renderScan(env, notify) {
   return { total: services.length, checked: targets.length, running: Object.keys(active).length, sent };
 }
 
+async function ensureCommands(env) {
+  if ((await env.STATE.get("cmds")) === CMDS_VERSION) return;
+  const id = /^-?\d+$/.test(String(env.CHAT_ID)) ? Number(env.CHAT_ID) : env.CHAT_ID;
+  await tg(env, "setMyCommands", { commands: COMMANDS, scope: { type: "chat", chat_id: id } });
+  await env.STATE.put("cmds", CMDS_VERSION);
+}
+
+// /deploys: the newest deploy of every Render service, fetched live.
+async function renderLatest(env) {
+  if (!env.RENDER_API_KEY) return "Render kuzatuvi o'chiq: RENDER_API_KEY secret qo'yilmagan.";
+  const rs = JSON.parse((await env.STATE.get("render")) || "null") || {};
+  const services = (await renderServices(env, rs, Date.now())).slice(0, RENDER_MAX);
+  if (!services.length) return "Render'da servis topilmadi.";
+  const rows = await Promise.all(
+    services.map(async (svc) => {
+      try {
+        const d = (await rd(env, `/services/${svc.id}/deploys?limit=1`))[0]?.deploy;
+        if (!d) return `• ${svc.name}: hali deploy yo'q`;
+        const icon = R_DONE[d.status]?.[0] || (R_LIVE.has(d.status) ? "🔄" : "•");
+        const msg = (d.commit?.message || "").split("\n")[0].slice(0, 60);
+        return `${icon} ${svc.name} · ${d.status} · ${ago(d.finishedAt || d.createdAt)} oldin${msg ? `\n${msg}` : ""}`;
+      } catch (e) {
+        return `⚠️ ${svc.name}: ${e.message}`;
+      }
+    }),
+  );
+  return `Render, oxirgi deploy'lar:\n\n${rows.join("\n\n")}\n\nLog uchun: /logs servis_nomi`;
+}
+
+const LOG_CHARS = 3400; // Telegram messages hold 4096 characters
+const esc = (t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+// /logs [servis] [build|app]: build log of the newest deploy (default) or the recent runtime log.
+async function renderLogs(env, args) {
+  if (!env.RENDER_API_KEY) return { text: "Render kuzatuvi o'chiq: RENDER_API_KEY secret qo'yilmagan." };
+  const type = args.some((a) => a.toLowerCase() === "app") ? "app" : "build";
+  const name = args.filter((a) => !["app", "build"].includes(a.toLowerCase())).join(" ").toLowerCase();
+
+  const rs = JSON.parse((await env.STATE.get("render")) || "null") || {};
+  if (rs.services?.some((x) => !x.owner)) rs.servicesAt = 0; // list saved before owner ids were kept
+  const services = await renderServices(env, rs, Date.now());
+  const names = services.map((x) => x.name).join(", ");
+  if (!services.length) return { text: "Render'da servis topilmadi." };
+
+  let svc;
+  if (name) {
+    svc = services.find((x) => x.name.toLowerCase() === name || x.id === name) || services.find((x) => x.name.toLowerCase().includes(name));
+    if (!svc) return { text: `"${name}" nomli servis topilmadi.\nBor servislar: ${names}` };
+  } else if (services.length === 1) {
+    svc = services[0];
+  } else {
+    return { text: `Qaysi servis? Masalan: /logs ${services[0].name}\nBor servislar: ${names}` };
+  }
+
+  const d = (await rd(env, `/services/${svc.id}/deploys?limit=1`))[0]?.deploy;
+  if (type === "build" && !d) return { text: `${svc.name}: hali deploy yo'q.` };
+  let owner = svc.owner;
+  if (!owner) owner = (await rd(env, "/owners?limit=1"))[0]?.owner?.id;
+
+  const q = new URLSearchParams({ ownerId: owner, resource: svc.id, type, direction: "backward", limit: "100" });
+  if (type === "build") {
+    const end = d.finishedAt || d.updatedAt || new Date().toISOString();
+    q.set("startTime", new Date(Date.parse(d.createdAt) - 60e3).toISOString());
+    q.set("endTime", new Date(Date.parse(end) + 60e3).toISOString());
+  }
+  const logs = ((await rd(env, `/logs?${q}`)).logs || []).reverse();
+
+  const clean = (m) => String(m).replace(/\x1b\[[0-9;]*m/g, "").trimEnd();
+  let lines = logs.map((l) => `${(l.timestamp || "").slice(11, 19)} ${clean(l.message)}`);
+  let body = esc(lines.join("\n")); // escape first: the 4096 limit counts the escaped text
+  const cut = body.length > LOG_CHARS;
+  if (cut) body = body.slice(-LOG_CHARS).replace(/^[^\n]*\n/, ""); // keep the END: that is where errors are
+
+  const status = d ? `${R_DONE[d.status]?.[0] || (R_LIVE.has(d.status) ? "🔄" : "•")} ${d.status} · ${ago(d.finishedAt || d.createdAt)} oldin` : "";
+  const head = type === "build" ? `📜 ${svc.name} · build logi\n${status}` : `📜 ${svc.name} · ish logi (oxirgi soat)`;
+  const note = cut ? "\n(oxirgi qismi ko'rsatildi)" : "";
+  if (!lines.length) return { text: `${head}\n\nBu oraliqda log topilmadi.${type === "build" ? "\nEski deploy loglari Render'da saqlanmagan bo'lishi mumkin." : ""}` };
+  return { text: `${esc(head)}${note}\n<pre>${body}</pre>`, html: true };
+}
+
 async function tick(env) {
   env = withBudget(env);
+  await ensureCommands(env).catch((e) => console.log("commands:", e.message));
   // Render goes first and is capped, so a Render problem never stops the GitHub scan.
   let render;
   try {
@@ -449,24 +557,53 @@ async function onUpdate(env, update) {
   // Only the owner's chat gets answers: repo names are private.
   if (!msg?.text || String(msg.chat?.id) !== String(env.CHAT_ID)) return;
   const cmd = msg.text.trim().split(/[\s@]/)[0].toLowerCase();
-  if (cmd !== "/start" && cmd !== "/status") return;
+  if (!["/start", "/status", "/builds", "/deploys", "/logs", "/help"].includes(cmd)) return;
+  const args = msg.text.trim().split(/\s+/).slice(1);
 
   env = withBudget(env);
   try {
+    if (cmd === "/help") {
+      await tg(env, "sendMessage", { chat_id: env.CHAT_ID, text: HELP });
+      return;
+    }
     await tg(env, "sendMessage", {
       chat_id: env.CHAT_ID,
       text: cmd === "/start" ? "👋 Salom! Build'larni tekshiryapman..." : "🔍 Tekshiryapman...",
     });
-    const render = await renderScan(env, false).catch((e) => {
-      console.log(e.message);
-      return { active: [] };
+    const work = async () => {
+      if (cmd === "/logs") {
+        const { text, html } = await renderLogs(env, args);
+        await tg(env, "sendMessage", { chat_id: env.CHAT_ID, text, ...(html ? { parse_mode: "HTML" } : {}), disable_web_page_preview: true });
+        return;
+      }
+      if (cmd === "/deploys") {
+        const text = await renderLatest(env);
+        await tg(env, "sendMessage", { chat_id: env.CHAT_ID, text, disable_web_page_preview: true });
+        return;
+      }
+      const onlyBuilds = cmd === "/builds";
+      const render = onlyBuilds
+        ? { active: [] }
+        : await renderScan(env, false).catch((e) => {
+            console.log(e.message);
+            return { active: [] };
+          });
+      const { active, total, missed } = await scan(env, false);
+      await tg(env, "sendMessage", {
+        chat_id: env.CHAT_ID,
+        text: statusText(active, total, missed, render.active, onlyBuilds ? "😴 Hozir faol build yo'q." : undefined),
+        disable_web_page_preview: true,
+      });
+    };
+    let timer;
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Vaqt tugadi: GitHub javob bermayapti yoki tekshiruv juda uzoq cho'zildi")), STATUS_DEADLINE);
     });
-    const { active, total, missed } = await scan(env, false);
-    await tg(env, "sendMessage", {
-      chat_id: env.CHAT_ID,
-      text: statusText(active, total, missed, render.active),
-      disable_web_page_preview: true,
-    });
+    try {
+      await Promise.race([work(), deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
   } catch (e) {
     console.log(e.message);
     await tg(env, "sendMessage", { chat_id: env.CHAT_ID, text: `⚠️ ${e.message}` }).catch(() => {});
@@ -478,12 +615,12 @@ function ago(iso) {
   return m < 60 ? `${m} daq` : `${Math.floor(m / 60)} soat ${m % 60} daq`;
 }
 
-function statusText(active, total, missed, renderActive = []) {
+function statusText(active, total, missed, renderActive = [], none = "😴 Hozir faol build va deploy yo'q.") {
   const scope =
     missed === 0
       ? `✅ Hammasi ko'rib chiqildi (${total} ta repo)`
       : `⚠️ ${total} ta repo'dan ${total - missed} tasi ko'rib chiqildi, qolgan ${missed} tasi har daqiqada navbat bilan tekshiriladi`;
-  if (!active.length && !renderActive.length) return `😴 Hozir faol build va deploy yo'q.\n${scope}`;
+  if (!active.length && !renderActive.length) return `${none}\n${scope}`;
   const list = [...active].sort((a, b) => Date.parse(a.started) - Date.parse(b.started));
   const lines = list
     .slice(0, MAX_LISTED)

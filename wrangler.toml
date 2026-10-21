@@ -8,3 +8,6 @@ crons = ["* * * * *"]
 [[kv_namespaces]]
 binding = "STATE"
 id = "4e64d63299e843c3b7afb357624aad6f"
+
+[observability]
+enabled = true
