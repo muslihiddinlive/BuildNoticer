@@ -71,6 +71,11 @@ export default {
       return new Response("ok");
     }
 
+    // ParadoksGram error reports from the apps (see handleReport). Separate from the build watcher below.
+    if (request.method === "POST" && url.pathname === "/report") {
+      return handleReport(request, env);
+    }
+
     if (!secret || url.searchParams.get("key") !== secret) return new Response("ok");
 
     // One-time: registers the webhook so the bot can hear /start and /status.
@@ -698,4 +703,102 @@ async function download(env, url) {
   const r2 = await fetch(location);
   if (!r2.ok) throw new Error(`Artifact download ${r2.status}`);
   return r2.blob();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Error reports sent by the ParadoksGram apps (Android / Windows): POST /report, multipart/form-data
+//   name, contact, message  - short text fields shown in the Telegram message
+//   user                    - account data the user agreed to send (id, username, phone), optional
+//   files                   - the log file
+// Optional secret REPORT_KEY: when set, requests must carry the header X-Report-Key.
+// The Telegram message goes to CHAT_ID. Each IP may send REPORT_PER_HOUR (default 6) reports per hour.
+// This route uses neither GITHUB_TOKEN nor the build watcher state.
+// ---------------------------------------------------------------------------------------------
+const REPORT_MAX_BYTES = 1_500_000;
+const REPORT_PER_HOUR = 6;
+
+const reportEsc = (t = "") => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+function reportJson(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+  });
+}
+
+async function reportTg(env, method, form) {
+  const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
+    method: "POST",
+    body: form,
+    signal: AbortSignal.timeout(30_000),
+  });
+  const data = await r.json().catch(() => ({}));
+  return r.ok && data.ok === true;
+}
+
+async function handleReport(request, env) {
+  try {
+    if (!env.BOT_TOKEN || !env.CHAT_ID) return reportJson({ ok: false, error: "not configured" }, 500);
+    if (env.REPORT_KEY && request.headers.get("X-Report-Key") !== env.REPORT_KEY) {
+      return reportJson({ ok: false, error: "forbidden" }, 403);
+    }
+    const len = Number(request.headers.get("content-length") || 0);
+    if (len > REPORT_MAX_BYTES) return reportJson({ ok: false, error: "too large" }, 413);
+
+    // Rate limit per IP, kept in KV for an hour. A KV hiccup must never block a report.
+    const ip = request.headers.get("CF-Connecting-IP") || "-";
+    const limit = Number(env.REPORT_PER_HOUR) || REPORT_PER_HOUR;
+    if (env.STATE && ip !== "-") {
+      const key = `rl:${ip}:${Math.floor(Date.now() / 3_600_000)}`;
+      try {
+        const used = Number(await env.STATE.get(key)) || 0;
+        if (used >= limit) return reportJson({ ok: false, error: "rate limit" }, 429);
+        await env.STATE.put(key, String(used + 1), { expirationTtl: 3700 });
+      } catch {}
+    }
+
+    let form;
+    try {
+      form = await request.formData();
+    } catch {
+      return reportJson({ ok: false, error: "multipart/form-data expected" }, 400);
+    }
+    const field = (n, max) => (form.get(n) || "").toString().trim().slice(0, max);
+    const name = field("name", 100);
+    const contact = field("contact", 150);
+    const message = field("message", 2600);
+    const user = field("user", 500);
+    const file = form.getAll("files").find((f) => f && typeof f === "object" && f.size > 0);
+    if (!message && !file) return reportJson({ ok: false, error: "empty" }, 400);
+
+    const cf = request.cf || {};
+    const place = [cf.city, cf.region, cf.country || request.headers.get("CF-IPCountry")].filter(Boolean).join(", ") || "-";
+    const isp = cf.asOrganization ? `${cf.asOrganization}${cf.asn ? ` (AS${cf.asn})` : ""}` : "-";
+
+    const text =
+      `🛠 <b>Xato hisoboti</b> — ${reportEsc(name) || "ParadoksGram"}\n` +
+      `🕒 ${reportEsc(contact) || "-"}\n` +
+      `🌍 Server ko'rgan joy: ${reportEsc(place)}\n` +
+      `📡 Provayder: ${reportEsc(isp)}\n` +
+      (user ? `\n👤 <b>Akkaunt (foydalanuvchi ruxsati bilan):</b>\n${reportEsc(user)}\n` : "") +
+      (message ? `\n<pre>${reportEsc(message)}</pre>` : "");
+
+    const fd = new FormData();
+    fd.append("chat_id", env.CHAT_ID);
+    fd.append("text", text.slice(0, 4000));
+    fd.append("parse_mode", "HTML");
+    fd.append("disable_web_page_preview", "true");
+    if (!(await reportTg(env, "sendMessage", fd))) return reportJson({ ok: false, error: "telegram" }, 502);
+
+    if (file) {
+      const doc = new FormData();
+      doc.append("chat_id", env.CHAT_ID);
+      doc.append("document", file, file.name || "log.txt");
+      doc.append("caption", `📎 ${file.name || "log.txt"}`.slice(0, 200));
+      if (!(await reportTg(env, "sendDocument", doc))) return reportJson({ ok: false, error: "telegram file" }, 502);
+    }
+    return reportJson({ ok: true });
+  } catch {
+    return reportJson({ ok: false, error: "server" }, 500);
+  }
 }
