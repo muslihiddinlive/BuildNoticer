@@ -79,6 +79,28 @@ export default {
     if (!secret || url.searchParams.get("key") !== secret) return new Response("ok");
 
     // One-time: registers the webhook so the bot can hear /start and /status.
+    // GET /latest — returns latest release info for in-app update check (no auth required)
+    if (request.method === "GET" && url.pathname === "/latest") {
+      try {
+        const repos = (env.REPOS || "").split(",").map(r => r.trim()).filter(Boolean);
+        const repo = repos.find(r => r.toLowerCase().includes("paradoksgram")) || repos[0];
+        if (!repo) return Response.json({ ok: false, error: "no repo" }, { status: 500 });
+        const rel = await gh(env, `/repos/${repo}/releases/latest`);
+        const build = parseInt((rel.tag_name || "").replace("build-", "")) || 0;
+        const asset = (rel.assets || []).find(a => a.name.endsWith(".apk"));
+        return Response.json({
+          ok: true,
+          build,
+          tag: rel.tag_name,
+          name: rel.name,
+          url: asset ? asset.browser_download_url : rel.html_url,
+          published_at: rel.published_at,
+        });
+      } catch (e) {
+        return Response.json({ ok: false, error: String(e.message) }, { status: 502 });
+      }
+    }
+
     if (url.pathname === "/setup") {
       const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/setWebhook`, {
         method: "POST",
