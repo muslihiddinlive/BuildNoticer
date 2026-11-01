@@ -709,10 +709,74 @@ async function sendArtifacts(env, repo, run, caption) {
         ? caption + (skipped ? `\n(+${skipped} ta katta fayl: ${run.html_url}#artifacts)` : "")
         : a.name,
     );
-    form.set("document", file, `${a.name}.zip`);
+    // GitHub always wraps an artifact in a .zip. When it holds a single file (an APK, say), send that file itself.
+    let single = null;
+    try {
+      single = await unzipSingle(file);
+    } catch (e) {
+      console.log(`unzip: ${e.message}`);
+    }
+    if (single && single.blob.size < TG_LIMIT) {
+      form.set("document", single.blob, single.name);
+    } else {
+      form.set("document", file, `${a.name}.zip`);
+    }
     await tg(env, "sendDocument", form);
   }
   return true;
+}
+
+// Returns {name, blob} when the zip holds exactly one file, otherwise null. Reads the central directory, so it
+// works with data descriptors too. Stored and deflate entries only; Zip64 returns null.
+async function unzipSingle(zip) {
+  const tailSize = Math.min(zip.size, 65557);
+  const tail = new DataView(await zip.slice(zip.size - tailSize).arrayBuffer());
+  let eocd = -1;
+  for (let i = tailSize - 22; i >= 0; i--) {
+    if (tail.getUint32(i, true) === 0x06054b50) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd < 0) return null;
+  const total = tail.getUint16(eocd + 10, true);
+  const cdSize = tail.getUint32(eocd + 12, true);
+  const cdOffset = tail.getUint32(eocd + 16, true);
+  if (total === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) return null;
+
+  const cdBuf = await zip.slice(cdOffset, cdOffset + cdSize).arrayBuffer();
+  const cd = new DataView(cdBuf);
+  const files = [];
+  for (let pos = 0; pos + 46 <= cdBuf.byteLength && cd.getUint32(pos, true) === 0x02014b50; ) {
+    const nameLen = cd.getUint16(pos + 28, true);
+    const extraLen = cd.getUint16(pos + 30, true);
+    const commentLen = cd.getUint16(pos + 32, true);
+    const name = new TextDecoder().decode(new Uint8Array(cdBuf, pos + 46, nameLen));
+    if (!name.endsWith("/")) {
+      files.push({
+        name,
+        method: cd.getUint16(pos + 10, true),
+        compSize: cd.getUint32(pos + 20, true),
+        offset: cd.getUint32(pos + 42, true),
+      });
+    }
+    pos += 46 + nameLen + extraLen + commentLen;
+  }
+  if (files.length !== 1) return null;
+  const f = files[0];
+  if (f.compSize === 0xffffffff || f.offset === 0xffffffff) return null;
+
+  const lh = new DataView(await zip.slice(f.offset, f.offset + 30).arrayBuffer());
+  if (lh.getUint32(0, true) !== 0x04034b50) return null;
+  const start = f.offset + 30 + lh.getUint16(26, true) + lh.getUint16(28, true);
+  const raw = zip.slice(start, start + f.compSize);
+  const name = f.name.split("/").pop();
+  if (f.method === 0) return { name, blob: raw };
+  if (f.method === 8) {
+    const blob = await new Response(raw.stream().pipeThrough(new DecompressionStream("deflate-raw"))).blob();
+    return { name, blob };
+  }
+  return null;
 }
 
 // The signed blob URL must be fetched without the GitHub token.
